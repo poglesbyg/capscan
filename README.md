@@ -83,12 +83,14 @@ own already-trusted path to the registry.
 |---|---|---|
 | `unsafe fn` / `unsafe impl` | high | |
 | FFI (`extern "C" { .. }`) | high | |
-| process spawn (`Command::new`) | high | |
+| exported symbol (`#[no_mangle]` / `#[export_name]`) | high | pins a symbol name so it's callable from outside the crate |
+| `mem::transmute` / `transmute_copy` | high | reinterprets bytes across types; a common UB source even among "safe" unsafe usage |
+| process spawn (`Command::new`, incl. `tokio::process::Command`) | high | |
 | `build.rs` present | high | runs arbitrary code with full FS/network access on every build |
 | proc-macro crate (`lib.proc-macro = true`) | high | runs arbitrary code at compile time |
 | native linkage (`package.links`) | high | |
 | `unsafe { .. }` block | medium | |
-| network access (`TcpStream`/`TcpListener`/`UdpSocket`) | medium | |
+| network access (`TcpStream`/`TcpListener`/`UdpSocket`/`UnixStream`, or a `reqwest::`/`hyper::`/`ureq::` call) | medium | |
 | filesystem write (`fs::write`, `remove_dir_all`, ...) | medium | |
 | `env::set_var` / `env::remove_var` | medium | |
 | `env::var` / `env::var_os` | low | read-only |

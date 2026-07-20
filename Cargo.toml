@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Diff the capability surface (unsafe, FFI, process/network/fs access, build scripts) of a crate between two versions before you `cargo update`."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/poglesbyg/capscan"
+readme = "README.md"
+keywords = ["cargo", "security", "supply-chain", "audit", "unsafe"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 
 [[bin]]
 name = "cargo-capscan"

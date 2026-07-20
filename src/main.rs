@@ -45,7 +45,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        CmdKind::Scan { name, version, json } => {
+        CmdKind::Scan {
+            name,
+            version,
+            json,
+        } => {
             let path = locate_or_fetch(&name, &version)?;
             let report = scan_dir(&name, &version, &path)?;
             if json {
@@ -94,7 +98,14 @@ fn print_report(r: &CrateReport) {
         return;
     }
     for s in &r.signals {
-        println!("  [{}] {}:{}  {} -- {}", s.kind.severity(), s.file, s.line, s.kind, s.detail);
+        println!(
+            "  [{}] {}:{}  {} -- {}",
+            s.kind.severity(),
+            s.file,
+            s.line,
+            s.kind,
+            s.detail
+        );
     }
 }
 
@@ -107,7 +118,14 @@ fn print_diff(d: &Diff) {
         if !d.added.is_empty() {
             println!("+ {} new signal(s):", d.added.len());
             for s in &d.added {
-                println!("    [{}] {}:{}  {} -- {}", s.kind.severity(), s.file, s.line, s.kind, s.detail);
+                println!(
+                    "    [{}] {}:{}  {} -- {}",
+                    s.kind.severity(),
+                    s.file,
+                    s.line,
+                    s.kind,
+                    s.detail
+                );
             }
         }
         if !d.added_dependencies.is_empty() {
@@ -118,11 +136,21 @@ fn print_diff(d: &Diff) {
     if !d.removed.is_empty() {
         println!("- {} signal(s) no longer present:", d.removed.len());
         for s in &d.removed {
-            println!("    [{}] {}:{}  {} -- {}", s.kind.severity(), s.file, s.line, s.kind, s.detail);
+            println!(
+                "    [{}] {}:{}  {} -- {}",
+                s.kind.severity(),
+                s.file,
+                s.line,
+                s.kind,
+                s.detail
+            );
         }
     }
     if !d.removed_dependencies.is_empty() {
-        println!("- removed dependencies: {}", d.removed_dependencies.join(", "));
+        println!(
+            "- removed dependencies: {}",
+            d.removed_dependencies.join(", ")
+        );
     }
 
     match d.worst_severity() {

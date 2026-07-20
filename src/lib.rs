@@ -32,6 +32,8 @@ pub enum SignalKind {
     BuildScript,
     ProcMacroCrate,
     NativeLinkage,
+    Transmute,
+    SymbolExport,
 }
 
 impl SignalKind {
@@ -39,9 +41,8 @@ impl SignalKind {
     pub fn severity(&self) -> Severity {
         use SignalKind::*;
         match self {
-            UnsafeFn | UnsafeImpl | Ffi | ProcessSpawn | BuildScript | NativeLinkage | ProcMacroCrate => {
-                Severity::High
-            }
+            UnsafeFn | UnsafeImpl | Ffi | ProcessSpawn | BuildScript | NativeLinkage
+            | ProcMacroCrate | Transmute | SymbolExport => Severity::High,
             UnsafeBlock | NetworkAccess | FilesystemWrite | EnvWrite => Severity::Medium,
             EnvRead | BuildTimeMacro => Severity::Low,
         }
@@ -64,6 +65,8 @@ impl fmt::Display for SignalKind {
             SignalKind::BuildScript => "build.rs script",
             SignalKind::ProcMacroCrate => "proc-macro crate",
             SignalKind::NativeLinkage => "native library linkage",
+            SignalKind::Transmute => "mem::transmute",
+            SignalKind::SymbolExport => "exported symbol",
         };
         f.write_str(s)
     }
@@ -137,9 +140,20 @@ fn path_str(path: &syn::Path) -> String {
 /// call through a re-exported alias) are expected; the goal is signal, not
 /// completeness.
 fn classify_call(v: &mut Visitor, path: &str, span: proc_macro2::Span) {
-    if path.ends_with("Command::new") {
+    if path.ends_with("mem::transmute") || path.ends_with("mem::transmute_copy") {
+        v.push(SignalKind::Transmute, span, path.to_string());
+    } else if path.ends_with("Command::new") {
         v.push(SignalKind::ProcessSpawn, span, path.to_string());
-    } else if path.contains("TcpStream") || path.contains("TcpListener") || path.contains("UdpSocket") {
+    } else if path.contains("TcpStream")
+        || path.contains("TcpListener")
+        || path.contains("TcpSocket")
+        || path.contains("UdpSocket")
+        || path.contains("UnixStream")
+        || path.contains("UnixListener")
+        || path.starts_with("reqwest::")
+        || path.starts_with("hyper::")
+        || path.starts_with("ureq::")
+    {
         v.push(SignalKind::NetworkAccess, span, path.to_string());
     } else if path.ends_with("fs::write")
         || path.ends_with("File::create")
@@ -153,9 +167,21 @@ fn classify_call(v: &mut Visitor, path: &str, span: proc_macro2::Span) {
         v.push(SignalKind::FilesystemWrite, span, path.to_string());
     } else if path.ends_with("env::set_var") || path.ends_with("env::remove_var") {
         v.push(SignalKind::EnvWrite, span, path.to_string());
-    } else if path.ends_with("env::var") || path.ends_with("env::vars") || path.ends_with("env::var_os") {
+    } else if path.ends_with("env::var")
+        || path.ends_with("env::vars")
+        || path.ends_with("env::var_os")
+    {
         v.push(SignalKind::EnvRead, span, path.to_string());
     }
+}
+
+/// `#[no_mangle]` / `#[export_name = "..."]` pin a function's symbol name so
+/// it can be called from outside the crate (cdylib/staticlib consumers, or
+/// linked C code) -- a distinct FFI surface from an `extern "C" { .. }` block.
+fn has_symbol_export_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("no_mangle") || a.path().is_ident("export_name"))
 }
 
 struct Visitor<'a> {
@@ -182,7 +208,18 @@ impl<'a, 'ast> Visit<'ast> for Visitor<'a> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if node.sig.unsafety.is_some() {
-            self.push(SignalKind::UnsafeFn, node.span(), node.sig.ident.to_string());
+            self.push(
+                SignalKind::UnsafeFn,
+                node.span(),
+                node.sig.ident.to_string(),
+            );
+        }
+        if has_symbol_export_attr(&node.attrs) {
+            self.push(
+                SignalKind::SymbolExport,
+                node.span(),
+                node.sig.ident.to_string(),
+            );
         }
         visit::visit_item_fn(self, node);
     }
@@ -196,7 +233,12 @@ impl<'a, 'ast> Visit<'ast> for Visitor<'a> {
     }
 
     fn visit_item_foreign_mod(&mut self, node: &'ast syn::ItemForeignMod) {
-        let abi = node.abi.name.as_ref().map(|l| l.value()).unwrap_or_default();
+        let abi = node
+            .abi
+            .name
+            .as_ref()
+            .map(|l| l.value())
+            .unwrap_or_default();
         self.push(
             SignalKind::Ffi,
             node.span(),
@@ -215,7 +257,10 @@ impl<'a, 'ast> Visit<'ast> for Visitor<'a> {
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         let name = path_str(&node.path);
-        if matches!(name.as_str(), "env" | "option_env" | "include" | "include_str" | "include_bytes") {
+        if matches!(
+            name.as_str(),
+            "env" | "option_env" | "include" | "include_str" | "include_bytes"
+        ) {
             self.push(SignalKind::BuildTimeMacro, node.span(), name);
         }
         visit::visit_macro(self, node);
@@ -241,11 +286,15 @@ pub fn scan_dir(name: &str, version: &str, root: &Path) -> Result<CrateReport> {
             continue;
         }
 
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         lines_scanned += content.lines().count();
 
-        let file_rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
+        let file_rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
 
         let parsed = match syn::parse_file(&content) {
             Ok(f) => f,
@@ -329,8 +378,9 @@ pub fn locate_or_fetch(name: &str, version: &str) -> Result<PathBuf> {
         return Ok(p);
     }
     fetch_via_cargo(name, version)?;
-    locate_cached(name, version)?
-        .with_context(|| format!("still couldn't find {name}-{version} in the registry cache after fetching"))
+    locate_cached(name, version)?.with_context(|| {
+        format!("still couldn't find {name}-{version} in the registry cache after fetching")
+    })
 }
 
 fn locate_cached(name: &str, version: &str) -> Result<Option<PathBuf>> {
@@ -402,10 +452,7 @@ impl Diff {
     /// tool's heuristics.
     pub fn worst_severity(&self) -> Option<Severity> {
         let sig_sev = self.added.iter().map(|s| s.kind.severity());
-        let dep_sev = self
-            .added_dependencies
-            .iter()
-            .map(|_| Severity::Medium);
+        let dep_sev = self.added_dependencies.iter().map(|_| Severity::Medium);
         sig_sev.chain(dep_sev).max()
     }
 }
@@ -439,7 +486,12 @@ pub fn diff_reports(old: &CrateReport, new: &CrateReport) -> Diff {
     added_dependencies.sort();
     removed_dependencies.sort();
 
-    added.sort_by(|a, b| b.kind.severity().cmp(&a.kind.severity()).then_with(|| a.file.cmp(&b.file)));
+    added.sort_by(|a, b| {
+        b.kind
+            .severity()
+            .cmp(&a.kind.severity())
+            .then_with(|| a.file.cmp(&b.file))
+    });
     removed.sort_by(|a, b| a.file.cmp(&b.file));
 
     Diff {
