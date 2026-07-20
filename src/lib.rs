@@ -370,6 +370,156 @@ pub fn scan_dir(name: &str, version: &str, root: &Path) -> Result<CrateReport> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedDependency {
+    pub name: String,
+    pub version: String,
+}
+
+/// Parse a `Cargo.lock` and return every dependency sourced from crates.io.
+/// Path and git dependencies (and the workspace's own root package, which
+/// has no `source` field) are skipped -- there's no "latest version" to
+/// compare a path dependency against.
+pub fn parse_lockfile(path: &Path) -> Result<Vec<LockedDependency>> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: toml::Value = content.parse().context("parsing Cargo.lock as TOML")?;
+    let packages = value
+        .get("package")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut deps = Vec::new();
+    for pkg in packages {
+        let is_registry_dep = pkg
+            .get("source")
+            .and_then(|s| s.as_str())
+            .map(|s| s.starts_with("registry+"))
+            .unwrap_or(false);
+        if !is_registry_dep {
+            continue;
+        }
+        if let (Some(name), Some(version)) = (
+            pkg.get("name").and_then(|v| v.as_str()),
+            pkg.get("version").and_then(|v| v.as_str()),
+        ) {
+            deps.push(LockedDependency {
+                name: name.to_string(),
+                version: version.to_string(),
+            });
+        }
+    }
+    Ok(deps)
+}
+
+/// Ask cargo what the latest published version of `name` is, by running
+/// `cargo add --dry-run` in a throwaway scratch project and reading the
+/// version back out of the scratch project's `Cargo.lock` -- not by parsing
+/// `cargo add`'s human-readable "Adding NAME vVERSION" summary, which
+/// truncates semver build metadata (`1.1.3+spec-1.1.0` prints as `1.1.3`,
+/// which then doesn't match any directory in the registry source cache).
+/// Reuses the same trusted cargo-shells-out path as [`locate_or_fetch`]
+/// rather than talking to the registry API directly. Returns `Ok(None)`
+/// (not an error) if the crate can't be resolved, e.g. it was pulled from
+/// crates.io since the lockfile was written.
+pub fn latest_version(name: &str) -> Result<Option<String>> {
+    let tmp = tempfile::tempdir().context("creating scratch dir")?;
+    let status = ProcCommand::new("cargo")
+        .args(["init", "--name", "capscan_probe", "--quiet"])
+        .current_dir(tmp.path())
+        .status()
+        .context("running `cargo init`")?;
+    if !status.success() {
+        bail!("`cargo init` failed while resolving the latest version of {name}");
+    }
+
+    let status = ProcCommand::new("cargo")
+        .args(["add", name, "--quiet"])
+        .current_dir(tmp.path())
+        .status()
+        .context("running `cargo add`")?;
+    if !status.success() {
+        return Ok(None); // crate not found / couldn't be resolved -- not a hard error
+    }
+
+    let deps = parse_lockfile(&tmp.path().join("Cargo.lock"))?;
+    Ok(deps.into_iter().find(|d| d.name == name).map(|d| d.version))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub name: String,
+    pub locked_version: String,
+    pub latest_version: String,
+    /// `None` means locked and latest are the same version -- nothing to diff.
+    pub diff: Option<Diff>,
+}
+
+impl AuditEntry {
+    pub fn worst_severity(&self) -> Option<Severity> {
+        self.diff.as_ref().and_then(Diff::worst_severity)
+    }
+}
+
+/// The end-to-end real-world workflow: read a project's `Cargo.lock`, find
+/// out which dependencies have a newer version published, and diff the
+/// capability surface for each one that does.
+pub fn audit_project(lockfile_path: &Path) -> Result<Vec<AuditEntry>> {
+    let deps = parse_lockfile(lockfile_path)?;
+
+    let mut unique_names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+    unique_names.sort_unstable();
+    unique_names.dedup();
+
+    let mut latest_by_name: HashMap<String, String> = HashMap::new();
+    for name in unique_names {
+        match latest_version(name) {
+            Ok(Some(v)) => {
+                latest_by_name.insert(name.to_string(), v);
+            }
+            Ok(None) => {
+                eprintln!("warning: couldn't resolve a latest version for {name}, skipping");
+            }
+            Err(e) => {
+                eprintln!("warning: failed to resolve latest version for {name}: {e}");
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    for dep in deps {
+        let Some(latest) = latest_by_name.get(&dep.name) else {
+            continue;
+        };
+
+        if *latest == dep.version {
+            entries.push(AuditEntry {
+                name: dep.name,
+                locked_version: dep.version,
+                latest_version: latest.clone(),
+                diff: None,
+            });
+            continue;
+        }
+
+        let old_path = locate_or_fetch(&dep.name, &dep.version)?;
+        let new_path = locate_or_fetch(&dep.name, latest)?;
+        let old_report = scan_dir(&dep.name, &dep.version, &old_path)?;
+        let new_report = scan_dir(&dep.name, latest, &new_path)?;
+        let diff = diff_reports(&old_report, &new_report);
+
+        entries.push(AuditEntry {
+            name: dep.name,
+            locked_version: dep.version,
+            latest_version: latest.clone(),
+            diff: Some(diff),
+        });
+    }
+
+    Ok(entries)
+}
+
 /// Find `name-version` in the local cargo registry source cache, fetching it
 /// into the cache first (via a scratch `cargo add && cargo fetch`) if it
 /// isn't there yet.

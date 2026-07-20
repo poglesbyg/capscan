@@ -1,5 +1,9 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
-use capscan::{diff_reports, locate_or_fetch, scan_dir, CrateReport, Diff, Severity};
+use capscan::{
+    audit_project, diff_reports, locate_or_fetch, scan_dir, AuditEntry, CrateReport, Diff, Severity,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -29,6 +33,16 @@ enum CmdKind {
         name: String,
         old_version: String,
         new_version: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scan every crates.io dependency in a Cargo.lock and flag which ones
+    /// would gain new capabilities if updated to their latest published
+    /// version. Exit code mirrors `diff`: worst severity found across all
+    /// dependencies.
+    Audit {
+        #[arg(long, default_value = "Cargo.lock")]
+        lockfile: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -78,6 +92,23 @@ fn main() -> Result<()> {
             }
 
             let code = match diff.worst_severity() {
+                Some(Severity::High) => 2,
+                Some(Severity::Medium) => 1,
+                Some(Severity::Low) | None => 0,
+            };
+            std::process::exit(code);
+        }
+        CmdKind::Audit { lockfile, json } => {
+            let entries = audit_project(&lockfile)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                print_audit(&entries);
+            }
+
+            let worst = entries.iter().filter_map(AuditEntry::worst_severity).max();
+            let code = match worst {
                 Some(Severity::High) => 2,
                 Some(Severity::Medium) => 1,
                 Some(Severity::Low) | None => 0,
@@ -157,4 +188,46 @@ fn print_diff(d: &Diff) {
         Some(sev) => println!("\nworst new severity: {sev}"),
         None => println!("\nno new risk detected"),
     }
+}
+
+fn print_audit(entries: &[AuditEntry]) {
+    let total = entries.len();
+    let up_to_date = entries.iter().filter(|e| e.diff.is_none()).count();
+    let mut with_updates: Vec<&AuditEntry> = entries.iter().filter(|e| e.diff.is_some()).collect();
+    with_updates.sort_by(|a, b| {
+        b.worst_severity()
+            .cmp(&a.worst_severity())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    println!("audited {total} registry dependencies ({up_to_date} already at latest)");
+
+    if with_updates.is_empty() {
+        println!("no pending updates.");
+        return;
+    }
+
+    println!("{} have updates available:", with_updates.len());
+    for e in &with_updates {
+        let diff = e.diff.as_ref().expect("filtered to Some above");
+        let sev = e
+            .worst_severity()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let extra_deps = if diff.added_dependencies.is_empty() {
+            String::new()
+        } else {
+            format!(", +{} new dep(s)", diff.added_dependencies.len())
+        };
+        println!(
+            "  [{sev:6}] {:<24} {} -> {}  (+{} signal(s), -{} signal(s){extra_deps})",
+            e.name,
+            e.locked_version,
+            e.latest_version,
+            diff.added.len(),
+            diff.removed.len(),
+        );
+    }
+
+    println!("\nrun `cargo capscan diff <name> <old> <new>` for details on any of the above.");
 }

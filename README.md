@@ -69,7 +69,30 @@ Exit code is `2` if the update adds a `high` severity signal, `1` for
 cargo capscan diff "$CRATE" "$OLD_VERSION" "$NEW_VERSION" || fail_the_build
 ```
 
-Add `--json` to either subcommand for machine-readable output.
+Audit an entire project at once — reads `Cargo.lock`, checks every crates.io
+dependency against its latest published version, and diffs the ones that are
+behind:
+
+```
+$ cargo capscan audit
+audited 54 registry dependencies (47 already at latest)
+7 have updates available:
+  [medium] serde_spanned            0.6.9 -> 1.1.1  (+0 signal(s), -0 signal(s), +1 new dep(s))
+  [medium] toml                     0.8.23 -> 1.1.3+spec-1.1.0  (+0 signal(s), -0 signal(s), +7 new dep(s))
+  [medium] toml_edit                0.22.27 -> 0.25.13+spec-1.1.0  (+0 signal(s), -2 signal(s), +5 new dep(s))
+  [none  ] syn                      2.0.119 -> 3.0.2  (+0 signal(s), -0 signal(s))
+  ...
+
+run `cargo capscan diff <name> <old> <new>` for details on any of the above.
+```
+
+(That's real output from running capscan on its own `Cargo.lock` — the
+`toml` 0.8 → 1.1 line is genuine: that major bump quietly pulls in 7 new
+transitive dependencies.) Point it at another lockfile with `--lockfile
+path/to/Cargo.lock`. Exit code is the worst severity found across every
+dependency, same scale as `diff`.
+
+Add `--json` to any subcommand for machine-readable output.
 
 If the requested version isn't already in your local cargo registry cache,
 capscan fetches it: it spins up a scratch project, runs
