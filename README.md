@@ -97,7 +97,25 @@ run `cargo capscan diff <name> <old> <new>` for details on any of the above.
 `toml` 0.8 → 1.1 line is genuine: that major bump quietly pulls in 7 new
 transitive dependencies.) Point it at another lockfile with `--lockfile
 path/to/Cargo.lock`. Exit code is the worst severity found across every
-dependency, same scale as `diff`.
+dependency, same scale as `diff` -- computed from *every* dependency
+regardless of `--min-severity` below, so filtering what's displayed never
+silently changes what a CI gate would catch.
+
+Add `--min-severity low`/`medium`/`high` to only show dependencies whose
+worst new capability is at least that severity, skipping the ones already
+at latest (or below the threshold) instead of scrolling past them:
+
+```
+$ cargo capscan audit --min-severity medium
+audited 54 registry dependencies (47 already at latest)
+4 have updates available:
+  [medium] serde_spanned            0.6.9 -> 1.1.1  (+0 signal(s), -0 signal(s), +1 new dep(s))
+  [medium] toml                     0.8.23 -> 1.1.3+spec-1.1.0  (+0 signal(s), -0 signal(s), +7 new dep(s))
+  ...
+```
+
+The header always reflects the true total either way; only the listed
+entries (and, with `--json`, the returned array) are filtered.
 
 Add `--json` to any subcommand for machine-readable output.
 

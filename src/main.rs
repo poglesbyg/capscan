@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use capscan::{
-    audit_project, diff_reports, locate_or_fetch, scan_dir, AuditEntry, CrateReport, Diff, Severity,
+    audit_project, diff_reports, filter_by_min_severity, locate_or_fetch, scan_dir, AuditEntry,
+    CrateReport, Diff, Severity,
 };
 use clap::{Parser, Subcommand};
 
@@ -39,12 +40,18 @@ enum CmdKind {
     /// Scan every crates.io dependency in a Cargo.lock and flag which ones
     /// would gain new capabilities if updated to their latest published
     /// version. Exit code mirrors `diff`: worst severity found across all
-    /// dependencies.
+    /// dependencies (computed from every dependency regardless of
+    /// --min-severity, which only affects what's displayed/returned).
     Audit {
         #[arg(long, default_value = "Cargo.lock")]
         lockfile: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Only show/return dependencies whose worst new capability is at
+        /// least this severity ("low", "medium", or "high"). Omit to see
+        /// every dependency, including ones already at latest.
+        #[arg(long)]
+        min_severity: Option<Severity>,
     },
 }
 
@@ -98,13 +105,21 @@ fn main() -> Result<()> {
             };
             std::process::exit(code);
         }
-        CmdKind::Audit { lockfile, json } => {
+        CmdKind::Audit {
+            lockfile,
+            json,
+            min_severity,
+        } => {
             let entries = audit_project(&lockfile)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
+                let output_entries = match min_severity {
+                    Some(threshold) => filter_by_min_severity(entries.clone(), threshold),
+                    None => entries.clone(),
+                };
+                println!("{}", serde_json::to_string_pretty(&output_entries)?);
             } else {
-                print_audit(&entries);
+                print_audit(&entries, min_severity);
             }
 
             let worst = entries.iter().filter_map(AuditEntry::worst_severity).max();
@@ -190,11 +205,20 @@ fn print_diff(d: &Diff) {
     }
 }
 
-fn print_audit(entries: &[AuditEntry]) {
+fn print_audit(entries: &[AuditEntry], min_severity: Option<Severity>) {
     let total = entries.len();
     let up_to_date = entries.iter().filter(|e| e.diff.is_none()).count();
-    let mut with_updates: Vec<&AuditEntry> = entries.iter().filter(|e| e.diff.is_some()).collect();
-    with_updates.sort_by(|a, b| {
+    let updated: Vec<&AuditEntry> = entries.iter().filter(|e| e.diff.is_some()).collect();
+
+    let mut shown: Vec<&AuditEntry> = updated
+        .iter()
+        .copied()
+        .filter(|e| match min_severity {
+            Some(threshold) => e.worst_severity().is_some_and(|sev| sev >= threshold),
+            None => true,
+        })
+        .collect();
+    shown.sort_by(|a, b| {
         b.worst_severity()
             .cmp(&a.worst_severity())
             .then_with(|| a.name.cmp(&b.name))
@@ -202,13 +226,22 @@ fn print_audit(entries: &[AuditEntry]) {
 
     println!("audited {total} registry dependencies ({up_to_date} already at latest)");
 
-    if with_updates.is_empty() {
+    if updated.is_empty() {
         println!("no pending updates.");
         return;
     }
 
-    println!("{} have updates available:", with_updates.len());
-    for e in &with_updates {
+    if shown.is_empty() {
+        let threshold = min_severity.expect("shown can only differ from updated when filtering");
+        println!(
+            "{} update(s) available, but none at or above '{threshold}' severity.",
+            updated.len()
+        );
+        return;
+    }
+
+    println!("{} have updates available:", shown.len());
+    for e in &shown {
         let diff = e.diff.as_ref().expect("filtered to Some above");
         let sev = e
             .worst_severity()

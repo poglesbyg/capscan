@@ -90,6 +90,21 @@ impl fmt::Display for Severity {
     }
 }
 
+impl std::str::FromStr for Severity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Ok(Severity::Low),
+            "medium" => Ok(Severity::Medium),
+            "high" => Ok(Severity::High),
+            other => Err(format!(
+                "invalid severity '{other}' (expected 'low', 'medium', or 'high')"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signal {
     pub kind: SignalKind,
@@ -461,6 +476,16 @@ impl AuditEntry {
     pub fn worst_severity(&self) -> Option<Severity> {
         self.diff.as_ref().and_then(Diff::worst_severity)
     }
+}
+
+/// Keep only entries whose worst new capability is at least `min_severity`
+/// -- entries with no diff at all (already at latest) never pass, since
+/// there's nothing to report for them.
+pub fn filter_by_min_severity(entries: Vec<AuditEntry>, min_severity: Severity) -> Vec<AuditEntry> {
+    entries
+        .into_iter()
+        .filter(|e| e.worst_severity().is_some_and(|sev| sev >= min_severity))
+        .collect()
 }
 
 /// Each lookup is dominated by `cargo` subprocess startup + registry-index

@@ -1,6 +1,11 @@
 use std::fs;
 
-use capscan::{diff_reports, parse_lockfile, scan_dir, CrateReport, Severity, Signal, SignalKind};
+use std::str::FromStr;
+
+use capscan::{
+    diff_reports, filter_by_min_severity, parse_lockfile, scan_dir, AuditEntry, CrateReport, Diff,
+    Severity, Signal, SignalKind,
+};
 use tempfile::TempDir;
 
 fn make_crate(files: &[(&str, &str)]) -> TempDir {
@@ -367,4 +372,60 @@ version = "0.1.0"
 fn severity_orders_low_lt_medium_lt_high() {
     assert!(Severity::Low < Severity::Medium);
     assert!(Severity::Medium < Severity::High);
+}
+
+#[test]
+fn severity_from_str_accepts_any_case() {
+    assert_eq!(Severity::from_str("low").unwrap(), Severity::Low);
+    assert_eq!(Severity::from_str("Medium").unwrap(), Severity::Medium);
+    assert_eq!(Severity::from_str("HIGH").unwrap(), Severity::High);
+}
+
+#[test]
+fn severity_from_str_rejects_unknown_values() {
+    let err = Severity::from_str("critical").unwrap_err();
+    assert!(err.contains("critical"));
+}
+
+fn audit_entry_with_severity(name: &str, worst: Option<Severity>) -> AuditEntry {
+    let diff = worst.map(|sev| {
+        let kind = match sev {
+            Severity::Low => SignalKind::EnvRead,
+            Severity::Medium => SignalKind::UnsafeBlock,
+            Severity::High => SignalKind::UnsafeFn,
+        };
+        Diff {
+            old: (name.to_string(), "1.0.0".to_string()),
+            new: (name.to_string(), "2.0.0".to_string()),
+            added: vec![Signal {
+                kind,
+                file: "src/lib.rs".to_string(),
+                line: 1,
+                detail: "x".to_string(),
+            }],
+            removed: vec![],
+            added_dependencies: vec![],
+            removed_dependencies: vec![],
+        }
+    });
+    AuditEntry {
+        name: name.to_string(),
+        locked_version: "1.0.0".to_string(),
+        latest_version: if worst.is_some() { "2.0.0" } else { "1.0.0" }.to_string(),
+        diff,
+    }
+}
+
+#[test]
+fn filter_by_min_severity_keeps_only_at_or_above_threshold() {
+    let entries = vec![
+        audit_entry_with_severity("up-to-date", None),
+        audit_entry_with_severity("low-only", Some(Severity::Low)),
+        audit_entry_with_severity("medium-hit", Some(Severity::Medium)),
+        audit_entry_with_severity("high-hit", Some(Severity::High)),
+    ];
+
+    let filtered = filter_by_min_severity(entries, Severity::Medium);
+    let names: Vec<&str> = filtered.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["medium-hit", "high-hit"]);
 }
