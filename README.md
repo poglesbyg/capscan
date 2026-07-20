@@ -16,11 +16,18 @@ you run before an update: no policy file, no crate list to maintain — just
 ## Install
 
 ```
+cargo install capscan
+```
+
+or, from a checkout of this repo:
+
+```
 cargo install --path .
 ```
 
-This installs `cargo-capscan` so `cargo capscan ...` works as a normal cargo
-subcommand. It also runs fine unbuilt-installed, straight from the repo:
+Either way this installs `cargo-capscan` so `cargo capscan ...` works as a
+normal cargo subcommand. It also runs fine unbuilt-installed, straight from
+the repo:
 
 ```
 cargo run --release --bin cargo-capscan -- scan anyhow 1.0.104
@@ -125,6 +132,39 @@ New dependencies pulled in by the update are also reported and count as
 Diffing keys signals on `(kind, detail)`, not file/line — a function moving
 50 lines down the file isn't a "new" signal, so updates with heavy internal
 refactors don't drown you in noise.
+
+## Use as a GitHub Action
+
+`action.yml` at the root of this repo wraps `cargo capscan audit` as a
+composite action, so any repo can gate CI on it without installing anything
+by hand:
+
+```yaml
+name: Dependency capability audit
+on:
+  pull_request:
+    paths: ['**/Cargo.lock']
+  schedule:
+    - cron: '0 6 * * 1'  # catch updates published on their own, not just yours
+
+jobs:
+  capscan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: poglesbyg/capscan@v0.1.0
+        with:
+          fail-on: medium   # 'high' | 'medium' | 'none' (report only)
+          # lockfile: path/to/Cargo.lock
+          # version: pin a specific capscan release; empty = latest
+```
+
+The action installs capscan via `cargo install`, runs `cargo capscan audit`,
+and fails the job if the worst severity found is at or above `fail-on`
+(default `medium`) — same severity scale as everywhere else in this README.
+It exposes the raw exit code as the `audit-exit-code` output if you want
+custom logic instead. This repo dogfoods it in its own
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) via `uses: ./`.
 
 ## Limitations
 

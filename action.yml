@@ -1,0 +1,68 @@
+name: 'capscan audit'
+description: 'Audit a Cargo.lock against latest published crate versions and fail CI when a dependency would gain new unsafe/FFI/process/network/build-script capabilities.'
+author: 'poglesbyg'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  lockfile:
+    description: 'Path to the Cargo.lock to audit.'
+    required: false
+    default: 'Cargo.lock'
+  fail-on:
+    description: "Minimum severity that fails the action: 'high', 'medium', or 'none' (report only, never fail)."
+    required: false
+    default: 'medium'
+  version:
+    description: 'capscan version to install (passed to `cargo install capscan --version`). Empty installs the latest release.'
+    required: false
+    default: ''
+
+outputs:
+  audit-exit-code:
+    description: "capscan's own exit code: 2 = new high severity signal, 1 = new medium severity signal, 0 = none."
+    value: ${{ steps.run-audit.outputs.audit-exit-code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: capscan-action-${{ inputs.version }}
+
+    - name: Install capscan
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          cargo install capscan --version "${{ inputs.version }}" --locked
+        else
+          cargo install capscan --locked
+        fi
+
+    - name: Run capscan audit
+      id: run-audit
+      shell: bash
+      run: |
+        set +e
+        cargo capscan audit --lockfile "${{ inputs.lockfile }}"
+        audit_exit=$?
+        set -e
+
+        echo "audit-exit-code=$audit_exit" >> "$GITHUB_OUTPUT"
+
+        case "${{ inputs.fail-on }}" in
+          high)   threshold=2 ;;
+          medium) threshold=1 ;;
+          none)   threshold=99 ;;
+          *)
+            echo "::error::invalid fail-on value '${{ inputs.fail-on }}' (expected high, medium, or none)"
+            exit 1
+            ;;
+        esac
+
+        if [ "$audit_exit" -ge "$threshold" ]; then
+          echo "::error::capscan found a new capability at or above '${{ inputs.fail-on }}' severity (exit code $audit_exit)"
+          exit 1
+        fi

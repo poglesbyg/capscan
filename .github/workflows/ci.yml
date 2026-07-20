@@ -23,3 +23,16 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+
+  capscan-self-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Dogfoods this repo's own action.yml against its own Cargo.lock.
+      # fail-on: none because we already know about a pending toml update
+      # (see the `audit` section of the README) that we haven't acted on
+      # yet -- this job is here to prove the action works, not to gate
+      # merges on a decision nobody's made.
+      - uses: ./
+        with:
+          fail-on: none
