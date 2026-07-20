@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use quote::ToTokens;
@@ -462,30 +463,70 @@ impl AuditEntry {
     }
 }
 
+/// Each lookup is dominated by `cargo` subprocess startup + registry-index
+/// I/O, not CPU, so it's worth running many at once even on a small number
+/// of cores. Capped rather than one-thread-per-name so a huge lockfile
+/// doesn't spawn hundreds of concurrent `cargo` processes fighting over the
+/// registry cache lock.
+const MAX_VERSION_LOOKUP_WORKERS: usize = 16;
+
+/// Resolve the latest published version of every name in `names`, in
+/// parallel. Each name is independent (its own scratch tempdir, no shared
+/// mutable state) so this is a plain worker pool over `std::thread::scope`
+/// rather than anything needing synchronization beyond collecting results.
+fn resolve_latest_versions(names: &[String]) -> HashMap<String, String> {
+    let worker_count = names.len().clamp(1, MAX_VERSION_LOOKUP_WORKERS);
+    let mut chunks: Vec<Vec<&str>> = vec![Vec::new(); worker_count];
+    for (i, name) in names.iter().enumerate() {
+        chunks[i % worker_count].push(name.as_str());
+    }
+
+    let mut latest_by_name = HashMap::new();
+    thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|name| (name, latest_version(name)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            for (name, resolved) in handle.join().expect("version-lookup worker panicked") {
+                match resolved {
+                    Ok(Some(v)) => {
+                        latest_by_name.insert(name.to_string(), v);
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "warning: couldn't resolve a latest version for {name}, skipping"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to resolve latest version for {name}: {e}");
+                    }
+                }
+            }
+        }
+    });
+    latest_by_name
+}
+
 /// The end-to-end real-world workflow: read a project's `Cargo.lock`, find
 /// out which dependencies have a newer version published, and diff the
 /// capability surface for each one that does.
 pub fn audit_project(lockfile_path: &Path) -> Result<Vec<AuditEntry>> {
     let deps = parse_lockfile(lockfile_path)?;
 
-    let mut unique_names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+    let mut unique_names: Vec<String> = deps.iter().map(|d| d.name.clone()).collect();
     unique_names.sort_unstable();
     unique_names.dedup();
 
-    let mut latest_by_name: HashMap<String, String> = HashMap::new();
-    for name in unique_names {
-        match latest_version(name) {
-            Ok(Some(v)) => {
-                latest_by_name.insert(name.to_string(), v);
-            }
-            Ok(None) => {
-                eprintln!("warning: couldn't resolve a latest version for {name}, skipping");
-            }
-            Err(e) => {
-                eprintln!("warning: failed to resolve latest version for {name}: {e}");
-            }
-        }
-    }
+    let latest_by_name = resolve_latest_versions(&unique_names);
 
     let mut entries = Vec::new();
     for dep in deps {
