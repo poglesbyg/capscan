@@ -137,6 +137,24 @@ capscan fetches it: it spins up a scratch project, runs
 `~/.cargo/registry/src/`. No custom download/untar code — it reuses cargo's
 own already-trusted path to the registry.
 
+`audit` answers "what's out of date vs. crates.io in general." A different,
+narrower question is "what did *this specific PR* change" — given two
+lockfiles (e.g. the base branch's and the PR branch's), which crates were
+added, removed, or bumped, and what did that do to their capability surface:
+
+```
+$ cargo capscan diff-lockfiles base.lock head.lock --markdown
+```
+
+Same underlying scan/diff machinery as `audit` and `diff`, but scoped to
+just the crates that actually changed between the two given lockfiles
+(rather than every dependency vs. its latest release), and each crate is
+scanned independently — one crate's transient network failure surfaces as
+an inline error for that crate, not a failed command. Supports `--json`,
+`--markdown` (a ready-to-post GitHub comment body — see PR-comment mode
+below), and `--min-severity`; exit code is the worst severity across every
+changed crate, same scale as `audit`/`diff`.
+
 ## What it detects
 
 | Signal | Severity | Notes |
@@ -195,6 +213,44 @@ and fails the job if the worst severity found is at or above `fail-on`
 It exposes the raw exit code as the `audit-exit-code` output if you want
 custom logic instead. This repo dogfoods it in its own
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) via `uses: ./`.
+
+### PR-comment mode
+
+`audit` above answers "does this fail CI." `pr-comment/action.yml` answers a
+narrower, more readable question: "what did *this PR's* dependency bumps
+actually change" -- posted straight to the PR as a comment, no separate
+webhook server or bot account needed, just the built-in `GITHUB_TOKEN`:
+
+```yaml
+name: capscan PR comment
+on:
+  pull_request:
+    paths: ['**/Cargo.lock']
+
+permissions:
+  pull-requests: write
+
+jobs:
+  capscan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: poglesbyg/capscan/pr-comment@v0.2.0
+        with:
+          min-severity: medium   # optional: only show crates at/above this severity
+          # lockfile: path/to/Cargo.lock
+          # version: pin a specific capscan release; empty = latest
+```
+
+It diffs the PR's head `Cargo.lock` against the base branch's version at
+`github.event.pull_request.base.sha` -- fetched directly via `git fetch
+--depth=1 origin <base_sha>` plus `git show`, so it works with the default
+shallow `actions/checkout@v4` checkout; no `fetch-depth: 0` needed. Each run
+edits the bot's own last comment (`gh pr comment --edit-last
+--create-if-none`) instead of piling up a new one per push. Uses
+`diff-lockfiles` under the hood (see above), so the same per-crate resilience
+applies: one crate's transient scan failure shows up as an inline error in
+that crate's row, not a failed job.
 
 ## Limitations
 

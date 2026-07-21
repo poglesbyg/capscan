@@ -1,0 +1,85 @@
+name: 'capscan PR comment'
+description: 'Post a PR comment showing the capability-surface diff for whatever Cargo.lock dependency bumps this specific PR introduces, using only the built-in GITHUB_TOKEN.'
+author: 'poglesbyg'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  lockfile:
+    description: 'Path to the head Cargo.lock (the PR branch''s current lockfile).'
+    required: false
+    default: 'Cargo.lock'
+  min-severity:
+    description: "Only show crates whose worst signal is at least this severity: 'high', 'medium', or 'low'. Empty shows everything that changed."
+    required: false
+    default: ''
+  version:
+    description: 'capscan version to install (passed to `cargo install capscan --version`). Empty installs the latest release.'
+    required: false
+    default: ''
+  github-token:
+    description: 'Token used to post the PR comment. Needs `pull-requests: write` permission.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  audit-exit-code:
+    description: "Worst exit code across all changed crates: 2 = new high severity signal, 1 = new medium severity signal, 0 = none."
+    value: ${{ steps.run-diff.outputs.audit-exit-code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check event type
+      if: github.event_name != 'pull_request'
+      shell: bash
+      run: |
+        echo "::error::the pr-comment action only runs on pull_request events (got '${{ github.event_name }}')"
+        exit 1
+
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: capscan-pr-comment-${{ inputs.version }}
+
+    - name: Install capscan
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          cargo install capscan --version "${{ inputs.version }}" --locked
+        else
+          cargo install capscan --locked
+        fi
+
+    - name: Fetch base Cargo.lock
+      shell: bash
+      run: |
+        git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+        git show "${{ github.event.pull_request.base.sha }}:${{ inputs.lockfile }}" > /tmp/capscan-base.lock
+
+    - name: Run capscan diff-lockfiles
+      id: run-diff
+      shell: bash
+      run: |
+        set +e
+        args=(diff-lockfiles /tmp/capscan-base.lock "${{ inputs.lockfile }}" --markdown)
+        if [ -n "${{ inputs.min-severity }}" ]; then
+          args+=(--min-severity "${{ inputs.min-severity }}")
+        fi
+        cargo capscan "${args[@]}" > /tmp/capscan-comment.md
+        diff_exit=$?
+        set -e
+
+        echo "audit-exit-code=$diff_exit" >> "$GITHUB_OUTPUT"
+
+    - name: Post or update PR comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --edit-last \
+          --create-if-none \
+          --body-file /tmp/capscan-comment.md
