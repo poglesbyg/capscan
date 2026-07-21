@@ -15,6 +15,18 @@ you run before an update: no policy file, no crate list to maintain — just
 
 ## Install
 
+Prebuilt binary, no Rust toolchain needed -- macOS, Linux, and Windows,
+from the [latest release](https://github.com/poglesbyg/capscan/releases/latest):
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/poglesbyg/capscan/releases/latest/download/capscan-installer.sh | sh
+```
+
+(PowerShell on Windows: see the install command on the
+[release page](https://github.com/poglesbyg/capscan/releases/latest).)
+
+Or build from source:
+
 ```
 cargo install capscan
 ```
