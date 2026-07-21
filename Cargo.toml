@@ -25,6 +25,7 @@ anyhow = "1"
 toml = "0.8"
 home = "0.5"
 tempfile = "3"
+libloading = "0.8"
 
 [profile.release]
 opt-level = 2
