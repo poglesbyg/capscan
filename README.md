@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: poglesbyg/capscan@v0.1.0
+      - uses: poglesbyg/capscan@v0.3.0
         with:
           fail-on: medium   # 'high' | 'medium' | 'none' (report only)
           # lockfile: path/to/Cargo.lock
@@ -235,7 +235,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: poglesbyg/capscan/pr-comment@v0.2.0
+      - uses: poglesbyg/capscan/pr-comment@v0.3.0
         with:
           min-severity: medium   # optional: only show crates at/above this severity
           # lockfile: path/to/Cargo.lock
