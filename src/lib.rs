@@ -429,6 +429,60 @@ pub fn parse_lockfile(path: &Path) -> Result<Vec<LockedDependency>> {
     Ok(deps)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockfileVersionChange {
+    pub name: String,
+    /// `None` means the crate is new in `new` (wasn't in `old` at all).
+    pub old_version: Option<String>,
+    /// `None` means the crate was removed (was in `old`, isn't in `new`).
+    pub new_version: Option<String>,
+}
+
+/// Diff two dependency lists from [`parse_lockfile`] and report every crate
+/// whose version changed, was added, or was removed between them. Pure and
+/// synchronous -- no network, no scanning, just set comparison -- so the
+/// (network-heavy) decision of what to do about each change is a separate
+/// concern from computing what changed. Built for reviewing a single PR's
+/// dependency bumps specifically: diff the base branch's `Cargo.lock`
+/// against the PR's, rather than [`audit_project`]'s "locked vs. latest
+/// published on crates.io," which answers a different question (see the
+/// `diff-lockfiles` CLI subcommand and the `pr-comment` GitHub Action).
+pub fn lockfile_version_changes(
+    old: &[LockedDependency],
+    new: &[LockedDependency],
+) -> Vec<LockfileVersionChange> {
+    let old_versions: HashMap<&str, &str> = old
+        .iter()
+        .map(|d| (d.name.as_str(), d.version.as_str()))
+        .collect();
+    let new_versions: HashMap<&str, &str> = new
+        .iter()
+        .map(|d| (d.name.as_str(), d.version.as_str()))
+        .collect();
+
+    let mut names: Vec<&str> = old_versions
+        .keys()
+        .chain(new_versions.keys())
+        .copied()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let mut changes = Vec::new();
+    for name in names {
+        let old_version = old_versions.get(name).copied();
+        let new_version = new_versions.get(name).copied();
+        if old_version != new_version {
+            changes.push(LockfileVersionChange {
+                name: name.to_string(),
+                old_version: old_version.map(String::from),
+                new_version: new_version.map(String::from),
+            });
+        }
+    }
+    changes
+}
+
 /// Ask cargo what the latest published version of `name` is, by running
 /// `cargo add --dry-run` in a throwaway scratch project and reading the
 /// version back out of the scratch project's `Cargo.lock` -- not by parsing
@@ -584,6 +638,92 @@ pub fn audit_project(lockfile_path: &Path) -> Result<Vec<AuditEntry>> {
     }
 
     Ok(entries)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockfileDiffResult {
+    pub name: String,
+    pub old_version: Option<String>,
+    pub new_version: Option<String>,
+    /// `None` for a removed dependency (nothing to characterize) or if
+    /// `error` is set. `Some` for an updated or newly-added dependency,
+    /// where "added" is represented as a diff from nothing: `added` is the
+    /// crate's full signal list, `removed` is empty.
+    pub diff: Option<Diff>,
+    /// Set if scanning this particular crate failed (e.g. a transient
+    /// network error) -- doesn't fail the whole comparison, since one
+    /// crate's problem shouldn't hide findings about every other crate
+    /// that changed in the same lockfile diff.
+    pub error: Option<String>,
+}
+
+impl LockfileDiffResult {
+    pub fn worst_severity(&self) -> Option<Severity> {
+        self.diff.as_ref().and_then(Diff::worst_severity)
+    }
+}
+
+fn diff_for_updated_crate(name: &str, old_version: &str, new_version: &str) -> Result<Diff> {
+    let old_path = locate_or_fetch(name, old_version)?;
+    let new_path = locate_or_fetch(name, new_version)?;
+    let old_report = scan_dir(name, old_version, &old_path)?;
+    let new_report = scan_dir(name, new_version, &new_path)?;
+    Ok(diff_reports(&old_report, &new_report))
+}
+
+fn diff_for_added_crate(name: &str, new_version: &str) -> Result<Diff> {
+    let path = locate_or_fetch(name, new_version)?;
+    let report = scan_dir(name, new_version, &path)?;
+    Ok(Diff {
+        old: (name.to_string(), String::new()),
+        new: (name.to_string(), new_version.to_string()),
+        added: report.signals,
+        removed: Vec::new(),
+        added_dependencies: report.dependencies,
+        removed_dependencies: Vec::new(),
+    })
+}
+
+/// Compare two `Cargo.lock` files -- typically a PR's base branch against
+/// its head -- and diff the capability surface of every crate whose
+/// version changed between them. This is the "review this specific PR's
+/// dependency bumps" question, distinct from [`audit_project`]'s "what's
+/// out of date relative to crates.io in general": a PR might bump serde
+/// from 1.0.200 to 1.0.210 while 1.0.229 is the latest published version,
+/// and the relevant comparison for reviewing *that PR* is 200->210, not
+/// 200->latest.
+pub fn diff_lockfiles(old_path: &Path, new_path: &Path) -> Result<Vec<LockfileDiffResult>> {
+    let old_deps = parse_lockfile(old_path)?;
+    let new_deps = parse_lockfile(new_path)?;
+    let changes = lockfile_version_changes(&old_deps, &new_deps);
+
+    let mut results = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (diff, error) = match (change.old_version.as_deref(), change.new_version.as_deref()) {
+            (Some(old_v), Some(new_v)) => {
+                match diff_for_updated_crate(&change.name, old_v, new_v) {
+                    Ok(diff) => (Some(diff), None),
+                    Err(e) => (None, Some(e.to_string())),
+                }
+            }
+            (None, Some(new_v)) => match diff_for_added_crate(&change.name, new_v) {
+                Ok(diff) => (Some(diff), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            // Removed dependency: nothing to scan, and not an error --
+            // removing a dependency isn't a capability risk to characterize.
+            (Some(_), None) | (None, None) => (None, None),
+        };
+
+        results.push(LockfileDiffResult {
+            name: change.name,
+            old_version: change.old_version,
+            new_version: change.new_version,
+            diff,
+            error,
+        });
+    }
+    Ok(results)
 }
 
 /// Find `name-version` in the local cargo registry source cache, fetching it

@@ -3,8 +3,8 @@ use std::fs;
 use std::str::FromStr;
 
 use capscan::{
-    diff_reports, filter_by_min_severity, parse_lockfile, scan_dir, AuditEntry, CrateReport, Diff,
-    Severity, Signal, SignalKind,
+    diff_reports, filter_by_min_severity, lockfile_version_changes, parse_lockfile, scan_dir,
+    AuditEntry, CrateReport, Diff, LockedDependency, Severity, Signal, SignalKind,
 };
 use tempfile::TempDir;
 
@@ -428,4 +428,57 @@ fn filter_by_min_severity_keeps_only_at_or_above_threshold() {
     let filtered = filter_by_min_severity(entries, Severity::Medium);
     let names: Vec<&str> = filtered.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["medium-hit", "high-hit"]);
+}
+
+fn locked(name: &str, version: &str) -> LockedDependency {
+    LockedDependency {
+        name: name.to_string(),
+        version: version.to_string(),
+    }
+}
+
+#[test]
+fn lockfile_version_changes_detects_updated_crate() {
+    let old = vec![locked("anyhow", "1.0.70"), locked("serde", "1.0.200")];
+    let new = vec![locked("anyhow", "1.0.104"), locked("serde", "1.0.200")];
+
+    let changes = lockfile_version_changes(&old, &new);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].name, "anyhow");
+    assert_eq!(changes[0].old_version.as_deref(), Some("1.0.70"));
+    assert_eq!(changes[0].new_version.as_deref(), Some("1.0.104"));
+}
+
+#[test]
+fn lockfile_version_changes_detects_added_and_removed_crates() {
+    let old = vec![locked("removed-dep", "1.0.0")];
+    let new = vec![locked("added-dep", "2.0.0")];
+
+    let changes = lockfile_version_changes(&old, &new);
+    assert_eq!(changes.len(), 2);
+
+    let added = changes.iter().find(|c| c.name == "added-dep").unwrap();
+    assert_eq!(added.old_version, None);
+    assert_eq!(added.new_version.as_deref(), Some("2.0.0"));
+
+    let removed = changes.iter().find(|c| c.name == "removed-dep").unwrap();
+    assert_eq!(removed.old_version.as_deref(), Some("1.0.0"));
+    assert_eq!(removed.new_version, None);
+}
+
+#[test]
+fn lockfile_version_changes_ignores_unchanged_crates() {
+    let deps = vec![locked("anyhow", "1.0.104"), locked("serde", "1.0.200")];
+    let changes = lockfile_version_changes(&deps, &deps.clone());
+    assert!(changes.is_empty());
+}
+
+#[test]
+fn lockfile_version_changes_is_sorted_by_name() {
+    let old = vec![locked("zzz", "1.0.0"), locked("aaa", "1.0.0")];
+    let new = vec![locked("zzz", "2.0.0"), locked("aaa", "2.0.0")];
+
+    let changes = lockfile_version_changes(&old, &new);
+    let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["aaa", "zzz"]);
 }
